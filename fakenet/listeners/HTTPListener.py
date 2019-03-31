@@ -14,7 +14,11 @@ import posixpath
 import mimetypes
 
 import time
-
+import shutil
+import traceback
+import subprocess
+from OpenSSL import crypto
+from ssl_utils import SSLWrapper
 from . import *
 
 MIME_FILE_RESPONSE = {
@@ -33,10 +37,14 @@ INDENT = '  '
 
 
 class HTTPListener(object):
+    SSL_UTILS = os.path.join("listeners", "ssl_utils")
+    CA_CERT = os.path.join(SSL_UTILS, "server.pem")
+    CA_KEY = os.path.join(SSL_UTILS, "privkey.pem")
+    NOT_AFTER_DELTA_SECONDS = 300  * 24 * 60 * 60
 
     def taste(self, data, dport):
-        
-        request_methods = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'TRACE', 
+
+        request_methods = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'TRACE',
             'OPTIONS', 'CONNECT', 'PATCH']
 
         confidence = 1 if dport in [80, 443] else 0
@@ -64,6 +72,7 @@ class HTTPListener(object):
 
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging_level)
+
         self.config = config
         self.name = name
         self.local_ip = config.get('ipaddr')
@@ -82,9 +91,9 @@ class HTTPListener(object):
             self.logger.error('Could not locate webroot directory: %s', path)
             sys.exit(1)
 
-
     def start(self):
         self.logger.debug('Starting...')
+
         self.server = ThreadedHTTPServer((self.local_ip, int(self.config.get('port'))), ThreadedHTTPRequestHandler)
         self.server.logger = self.logger
         self.server.config = self.config
@@ -92,21 +101,14 @@ class HTTPListener(object):
         self.server.extensions_map = self.extensions_map
 
         if self.config.get('usessl') == 'Yes':
-            self.logger.debug('Using SSL socket.')
+            config = {
+                'static_ca': self.config.get('static_ca'),
+                'ca_cert': self.config.get('ca_cert'),
+                'ca_key': self.config.get('ca_key'),
+            }
+            self.sslwrapper = SSLWrapper(config)
+            self.server.socket = self.sslwrapper.wrap_socket(self.server.socket)
 
-            keyfile_path = 'listeners/ssl_utils/privkey.pem'
-            keyfile_path = ListenerBase.abs_config_path(keyfile_path)
-            if keyfile_path is None:
-                self.logger.error('Could not locate %s', keyfile_path)
-                sys.exit(1)
-
-            certfile_path = 'listeners/ssl_utils/server.pem'
-            certfile_path = ListenerBase.abs_config_path(certfile_path)
-            if certfile_path is None:
-                self.logger.error('Could not locate %s', certfile_path)
-                sys.exit(1)
-
-            self.server.socket = ssl.wrap_socket(self.server.socket, keyfile=keyfile_path, certfile=certfile_path, server_side=True, ciphers='RSA')
 
         self.server_thread = threading.Thread(target=self.server.serve_forever)
         self.server_thread.daemon = True
@@ -117,6 +119,15 @@ class HTTPListener(object):
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+
+        if self.config.get('usessl' == 'Yes'):
+            cert = self.sslwrap._load_cert(self.ca_cert)
+            if cert is not None:
+                self.sslwrap._remove_root_ca(cert.get_subject().CN)
+            try:
+                shutil.rmtree(self.CERT_DIR)
+            except:
+                pass
 
 
 class ThreadedHTTPServer(BaseHTTPServer.HTTPServer):
@@ -192,7 +203,7 @@ class ThreadedHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
                     http_f.close()
                 else:
-                    self.server.logger.error('Failed to write HTTP POST headers and data to %s.', http_filename)        
+                    self.server.logger.error('Failed to write HTTP POST headers and data to %s.', http_filename)
 
         # Get response type based on the requested path
         response, response_type = self.get_response(self.path)
@@ -241,7 +252,7 @@ class ThreadedHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except Exception, e:
             self.server.logger.error('Failed to open response file: %s', response_filename)
             response_type = 'text/html'
-        else:            
+        else:
             response = f.read()
             f.close()
 
@@ -282,7 +293,7 @@ def main():
 
     """
     logging.basicConfig(format='%(asctime)s [%(name)15s] %(message)s', datefmt='%m/%d/%y %I:%M:%S %p', level=logging.DEBUG)
-    
+
     config = {'port': '8443', 'usessl': 'Yes', 'webroot': 'fakenet/defaultFiles' }
 
     listener = HTTPListener(config)

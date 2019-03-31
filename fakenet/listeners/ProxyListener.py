@@ -10,14 +10,17 @@ import select
 import logging
 import ssl
 from OpenSSL import SSL
-from ssl_utils import ssl_detector
+from ssl_utils import ssl_detector, SSLWrapper
 from . import *
 import os
+import traceback
+import shutil
 
 BUF_SZ = 1024
 
-class ProxyListener(object):
+CERT_DIR = "temp_certs"
 
+class ProxyListener(object):
 
     def __init__(
             self,
@@ -38,8 +41,12 @@ class ProxyListener(object):
         self.logger.debug('Starting...')
 
         self.logger.debug('Initialized with config:')
+        if self.config.get('cert_dir', None) is None:
+            self.config['cert_dir'] = CERT_DIR
+
         for key, value in config.iteritems():
             self.logger.debug('  %10s: %s', key, value)
+    
 
     def start(self):
 
@@ -89,6 +96,11 @@ class ProxyListener(object):
         if self.server:
             self.server.shutdown()
             self.server.server_close()
+        self.logger.warn("Trying to cleanup certificate directory")
+        try:
+            shutil.rmtree(self.config.get('cert_dir', CERT_DIR))
+        except:
+            pass
 
     def acceptListeners(self, listeners):
         self.server.listeners = listeners
@@ -159,7 +171,6 @@ def get_top_listener(config, data, listeners, diverter, orig_src_ip,
 
 class ThreadedTCPRequestHandler(SocketServer.BaseRequestHandler):
 
-    
     def handle(self):
 
         remote_sock = self.request
@@ -168,22 +179,6 @@ class ThreadedTCPRequestHandler(SocketServer.BaseRequestHandler):
         # queue for data received from remote
         remote_q = Queue.Queue()
         data = None
-
-        ssl_remote_sock = None
-
-        keyfile_path = 'listeners/ssl_utils/privkey.pem'
-        keyfile_path = ListenerBase.abs_config_path(keyfile_path)
-        if keyfile_path is None:
-            self.logger.error('Could not locate %s', keyfile_path)
-            sys.exit(1)
-
-        certfile_path = 'listeners/ssl_utils/server.pem'
-        certfile_path = ListenerBase.abs_config_path(certfile_path)
-        if certfile_path is None:
-            self.logger.error('Could not locate %s', certfile_path)
-            sys.exit(1)
-
-        ssl_version = ssl.PROTOCOL_SSLv23
 
         try:
             data = remote_sock.recv(BUF_SZ, socket.MSG_PEEK)
@@ -198,17 +193,22 @@ class ThreadedTCPRequestHandler(SocketServer.BaseRequestHandler):
             self.server.logger.warning('recv() error: %s' % e.message)
 
         if data:
-
             if ssl_detector.looks_like_ssl(data):
+                config = {
+                    'cert_dir': self.server.config.get('cert_dir'),
+                    'networkmode': self.server.config.get('networkmode', None),
+                    'static_ca': self.server.config.get('static_ca', False),
+                    'ca_cert': self.server.config.get('ca_cert'),
+                    'ca_key': self.server.config.get('ca_key')
+                }
+                self.sslwrapper = SSLWrapper(config)
                 self.server.logger.debug('SSL detected')
-                ssl_remote_sock = ssl.wrap_socket(
-                        remote_sock, 
-                        server_side=True, 
-                        do_handshake_on_connect=True,
-                        certfile=certfile_path, 
-                        ssl_version=ssl_version,
-                        keyfile=keyfile_path )
+                ssl_remote_sock = self.sslwrapper.wrap_socket(remote_sock)
                 data = ssl_remote_sock.recv(BUF_SZ)
+
+            else:
+                ssl_remote_sock = None
+            
             
             orig_src_ip = self.client_address[0]
             orig_src_port = self.client_address[1]
